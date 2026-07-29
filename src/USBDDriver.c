@@ -38,6 +38,9 @@ void USBDCoreInit(void) {
 
     // global interrupt enable
     OTG->GAHBCFG |= USB_OTG_GAHBCFG_GINT;
+
+    OTGD->DOEPMSK |= USB_OTG_DOEPMSK_XFRCM;
+    OTGD->DIEPMSK |= USB_OTG_DIEPMSK_XFRCM;
 }
 
 void USBDConnect(uint8_t enable) {
@@ -76,11 +79,12 @@ static void RXFIFOConfig(uint16_t rxSize) {
 }
 
 static void TXFIFOConfig(uint8_t epNum, uint16_t txSize) {
+    // adding 3 guarantees word alignment
     txSize = (txSize + 3) / 4;
 
     if (epNum == 0) {
-        OTG->DIEPTXF0_HNPTXFSIZ &= ~USB_OTG_NPTXFD_Msk;
-        OTG->DIEPTXF0_HNPTXFSIZ |= (txSize << USB_OTG_NPTXFD_Pos);
+        OTG->DIEPTXF0_HNPTXFSIZ &= ~USB_OTG_TX0FD;
+        OTG->DIEPTXF0_HNPTXFSIZ |= (txSize << USB_OTG_TX0FD_Pos);
     }
     else {
         OTG->DIEPTXF[epNum - 1] &= ~USB_OTG_NPTXFD;
@@ -88,6 +92,12 @@ static void TXFIFOConfig(uint8_t epNum, uint16_t txSize) {
     }
 
     recalculateFIFOStarts();
+}
+
+static void readPacket(void *buffer, uint16_t size) {
+    uint32_t *fifo = FIFO(0);
+
+    
 }
 
 static void RXFIFOFlush(void) {
@@ -99,16 +109,39 @@ static void TXFIFOFlush(uint8_t epNum) {
     OTG->GRSTCTL |= ((epNum << USB_OTG_GRSTCTL_TXFNUM_Pos) | USB_OTG_GRSTCTL_TXFFLSH);
 }
 
+static void deconfigEP(uint8_t epNum) {
+    USB_OTG_INEndpointTypeDef *epi = INEP(epNum);
+    USB_OTG_OUTEndpointTypeDef *epo = OUTEP(epNum);
+
+    OTGD->DAINTMSK &= ~((1 << epNum) | (1 << 16 << epNum));
+
+    epi->DIEPINT |= 0x287B;
+    epo->DOEPINT |= 0x313B;
+
+    if (epi->DIEPCTL & USB_OTG_DIEPCTL_EPENA) {
+        epi->DIEPCTL |= USB_OTG_DIEPCTL_EPDIS;
+    }
+
+    epi->DIEPCTL &= ~USB_OTG_DIEPCTL_USBAEP;
+
+    if (epNum != 0) {
+        if (epo->DOEPCTL & USB_OTG_DOEPCTL_EPENA) {
+            epo->DOEPCTL |= USB_OTG_DOEPCTL_EPDIS;
+        }
+        epo->DOEPCTL &= ~USB_OTG_DOEPCTL_USBAEP;
+    }
+}
+
 static void ep0Config() {
     // unmask ep interrupt
     OTGD->DAINTMSK |= ((1 << 16) | (1 << 0));
 
     // 00 in MPSIZ = 64B max packet size
-    INEP(0)->DIEPCTL &= (0x03 << USB_OTG_DIEPCTL_MPSIZ_Pos);
+    INEP(0)->DIEPCTL &= ~(0x03 << USB_OTG_DIEPCTL_MPSIZ_Pos);
     INEP(0)->DIEPCTL |= (USB_OTG_DIEPCTL_USBAEP | USB_OTG_DIEPCTL_SNAK);
 
     // same thing
-    OUTEP(0)->DOEPCTL &= (0x03 << USB_OTG_DOEPCTL_MPSIZ_Pos);
+    OUTEP(0)->DOEPCTL &= ~(0x03 << USB_OTG_DOEPCTL_MPSIZ_Pos); 
     OUTEP(0)->DOEPCTL |= (USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_CNAK);
 
     RXFIFOConfig(64);
@@ -122,34 +155,59 @@ static void inEPConfig(uint8_t epNum, USBEPType epType, uint16_t epSize) {
     INEP(epNum)->DIEPCTL |= (USB_OTG_DIEPCTL_USBAEP | (epSize << USB_OTG_DIEPCTL_MPSIZ_Pos) | USB_OTG_DIEPCTL_SNAK |
                             (epType << USB_OTG_DIEPCTL_EPTYP_Pos) | (epNum << USB_OTG_DIEPCTL_TXFNUM_Pos) | USB_OTG_DIEPCTL_SD0PID_SEVNFRM);
 
-    TXFIFOConifg(epNum, epSize);
+    TXFIFOConfig(epNum, epSize);
 }
 
 static void resetHandler(void) {
+    GPIOC->ODR &= ~(1 << 13);
 
+    for (uint8_t i = 0; i < EPCOUNT; i++) {
+        deconfigEP(i);
+    }
+}
+
+static void rxflvlHandler() {
+    uint32_t r = OTG->GRXSTSP;
+    uint8_t epNum = ((r & USB_OTG_GRXSTSP_EPNUM) >> USB_OTG_GRXSTSP_EPNUM_Pos);
+    uint16_t bcnt = ((r & USB_OTG_GRXSTSP_BCNT) >> USB_OTG_GRXSTSP_BCNT);
+    uint8_t pktsts = ((r & USB_OTG_GRXSTSP_PKTSTS) >> USB_OTG_GRXSTSP_PKTSTS_Pos);
+
+    switch (pktsts) {
+        case (0x02): // out packet (data)
+            break;
+        case (0x06): // setup packet (data)
+            break;
+        case (0x04): // setup transaction complete
+            OUTEP(epNum)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+            break;
+        case (0x03): // out transfer complete
+            OUTEP(epNum)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+            break;
+    }
 }
 
 void GINTSTSHandler(void) {
     volatile uint32_t a = OTG->GINTSTS;
 
     if (a & USB_OTG_GINTSTS_USBRST) {
-        OTG->GINTSTS |= USB_OTG_GINTSTS_USBRST;
+        resetHandler();
 
+        OTG->GINTSTS |= USB_OTG_GINTSTS_USBRST;
     }
     else if (a & USB_OTG_GINTSTS_ENUMDNE) {
-        OTG->GINTSTS |= USB_OTG_GINTSTS_ENUMDNE;
+        ep0Config();
 
+        OTG->GINTSTS |= USB_OTG_GINTSTS_ENUMDNE;
     }
     else if (a & USB_OTG_GINTSTS_RXFLVL) {
-        OTG->GINTSTS |= USB_OTG_GINTSTS_RXFLVL;
+        rxflvlHandler();
 
+        OTG->GINTSTS |= USB_OTG_GINTSTS_RXFLVL;
     }
     else if (a & USB_OTG_GINTSTS_IEPINT) {
         OTG->GINTSTS |= USB_OTG_GINTSTS_IEPINT;
-
     }
     else if (a & USB_OTG_GINTSTS_OEPINT) {
         OTG->GINTSTS |= USB_OTG_GINTSTS_OEPINT;
-
     }
 }

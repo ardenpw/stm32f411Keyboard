@@ -14,6 +14,10 @@ static inline USB_OTG_OUTEndpointTypeDef *OUTEP(uint8_t epNum) {
     return (USB_OTG_OUTEndpointTypeDef *)(USB_OTG_FS_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE + (0x20 * epNum));
 }
 
+static inline __IO uint32_t *FIFO(uint8_t epNum) {
+    return (__IO uint32_t *)(USB_OTG_FS_PERIPH_BASE + USB_OTG_FIFO_BASE + (0x1000 * epNum));
+}
+
 void USBDPinInit(void);
 void USBDCoreInit(void);
 void USBDConnect(uint8_t enable);
