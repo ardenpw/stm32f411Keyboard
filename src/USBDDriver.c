@@ -2,7 +2,7 @@
 #include "USBDDriver.h"
 #include "USBCoreDefs.h"
 
-void USBDPinInit(void) {
+static void USBDPinInit(void) {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
 
     GPIOA->AFR[1] &= ~(GPIO_AFRH_AFSEL11 | GPIO_AFRH_AFSEL12);
@@ -12,7 +12,7 @@ void USBDPinInit(void) {
     GPIOA->MODER |= ((10 << GPIO_MODER_MODER11_Pos) | (10 << GPIO_MODER_MODER12_Pos));
 }
 
-void USBDCoreInit(void) {
+static void USBDCoreInit(void) {
     // enable otg clock
     RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
 
@@ -43,7 +43,12 @@ void USBDCoreInit(void) {
     OTGD->DIEPMSK |= USB_OTG_DIEPMSK_XFRCM;
 }
 
-void USBDConnect(uint8_t enable) {
+static void USBDSetDAD(uint8_t addr) {
+    OTGD->DCFG &= ~USB_OTG_DCFG_DAD;
+    OTGD->DCFG |= (addr << USB_OTG_DCFG_DAD_Pos);
+}
+
+static void USBDConnect(uint8_t enable) {
     if (enable >= 1) {
         OTG->GCCFG |= USB_OTG_GCCFG_PWRDWN;
         OTGD->DCTL &= ~USB_OTG_DCTL_SDIS;
@@ -97,7 +102,37 @@ static void TXFIFOConfig(uint8_t epNum, uint16_t txSize) {
 static void readPacket(void *buffer, uint16_t size) {
     uint32_t *fifo = FIFO(0);
 
-    
+    // scan in words
+    for (; size >= 4; size -= 4, buffer += 4) {
+        uint32_t data = *fifo;
+        *((uint32_t *)buffer) = data; 
+    }
+
+    // scan with our last word, but turn it into bytes (not word aligned)
+    if (size > 0) {
+        uint32_t data = *fifo;
+
+        for (; size > 0; size--, buffer++, data >>= 8) {
+            *((uint8_t *)buffer) = 0xFF & data;
+        }
+    }
+}
+
+static void writePacket(uint8_t epNum, void const *buffer, uint16_t size) {
+    uint32_t *fifo = FIFO(epNum);
+    USB_OTG_INEndpointTypeDef *iep = INEP(epNum);
+
+    iep->DIEPTSIZ = 0;
+    iep->DIEPTSIZ |= ((1 << USB_OTG_HCTSIZ_PKTCNT_Pos) | (size << USB_OTG_DIEPTSIZ_XFRSIZ_Pos));
+
+    iep->DIEPCTL &= USB_OTG_DIEPCTL_STALL;
+    iep->DIEPCTL |= (USB_OTG_DIEPCTL_CNAK | USB_OTG_DIEPCTL_EPENA);
+
+    size = (size + 3) / 4;
+
+    for(; size > 0; size--, buffer += 4) {
+        *fifo = *((uint32_t *)buffer);
+    }
 }
 
 static void RXFIFOFlush(void) {
@@ -169,7 +204,7 @@ static void resetHandler(void) {
 static void rxflvlHandler() {
     uint32_t r = OTG->GRXSTSP;
     uint8_t epNum = ((r & USB_OTG_GRXSTSP_EPNUM) >> USB_OTG_GRXSTSP_EPNUM_Pos);
-    uint16_t bcnt = ((r & USB_OTG_GRXSTSP_BCNT) >> USB_OTG_GRXSTSP_BCNT);
+    uint16_t bcnt = ((r & USB_OTG_GRXSTSP_BCNT) >> USB_OTG_GRXSTSP_BCNT_Pos);
     uint8_t pktsts = ((r & USB_OTG_GRXSTSP_PKTSTS) >> USB_OTG_GRXSTSP_PKTSTS_Pos);
 
     switch (pktsts) {
@@ -186,7 +221,7 @@ static void rxflvlHandler() {
     }
 }
 
-void GINTSTSHandler(void) {
+static void GINTSTSHandler(void) {
     volatile uint32_t a = OTG->GINTSTS;
 
     if (a & USB_OTG_GINTSTS_USBRST) {
@@ -211,3 +246,16 @@ void GINTSTSHandler(void) {
         OTG->GINTSTS |= USB_OTG_GINTSTS_OEPINT;
     }
 }
+
+const USBdriver USBDriver = {
+    .USBDCoreInit = &USBDCoreInit,
+    .setDAD = &USBDSetDAD,
+    .USBDPinInit = &USBDPinInit,
+    .USBDConnect = &USBDConnect,
+    .RXFIFOFlush = &RXFIFOFlush,
+    .TXFIFOFlush = &TXFIFOFlush,
+    .inEPConfig = &inEPConfig,
+    .readPacket = &readPacket,
+    .writePacket = &writePacket,
+    .poll = &GINTSTSHandler
+};
